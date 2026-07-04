@@ -8,7 +8,7 @@ import {
   DeleteCommand,
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { RekognitionClient, DetectLabelsCommand } from '@aws-sdk/client-rekognition';
 
@@ -27,6 +27,18 @@ const json = (statusCode: number, body: unknown): APIGatewayProxyResult => ({
   },
   body: JSON.stringify(body),
 });
+
+// The S3 bucket is private, so any task with an image needs a short-lived
+// pre-signed GET URL for the frontend to actually display it.
+async function withImageViewUrl<T extends { imageKey: string | null }>(item: T) {
+  if (!item.imageKey) return item;
+  const imageViewUrl = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: BUCKET_NAME, Key: item.imageKey }),
+    { expiresIn: 300 }
+  );
+  return { ...item, imageViewUrl };
+}
 
 export const handler = async (
   event: APIGatewayProxyEvent
@@ -120,7 +132,8 @@ async function listTasks(userId?: string) {
     })
   );
 
-  return json(200, result.Items ?? []);
+  const items = await Promise.all((result.Items ?? []).map(withImageViewUrl));
+  return json(200, items);
 }
 
 async function getTask(taskId: string, userId?: string) {
@@ -135,13 +148,23 @@ async function getTask(taskId: string, userId?: string) {
   if (!result.Item) {
     return json(404, { message: 'Task not found' });
   }
-  return json(200, result.Item);
+  return json(200, await withImageViewUrl(result.Item));
 }
 
 async function updateTask(taskId: string, body: any) {
-  const { userId, title, description, dueDate, status } = body;
+  const { userId, title, description, dueDate, status, requestImageUpload } = body;
   if (!userId) {
     return json(400, { message: 'userId is required' });
+  }
+
+  // Attaching/replacing an image on an existing task reuses its imageKey if
+  // one was already reserved at creation time, otherwise mints a new one.
+  let imageKey: string | undefined;
+  if (requestImageUpload) {
+    const existing = await ddb.send(
+      new GetCommand({ TableName: TABLE_NAME, Key: { taskId, userId } })
+    );
+    imageKey = existing.Item?.imageKey ?? `${userId}/${taskId}`;
   }
 
   const result = await ddb.send(
@@ -149,7 +172,8 @@ async function updateTask(taskId: string, body: any) {
       TableName: TABLE_NAME,
       Key: { taskId, userId },
       UpdateExpression:
-        'set title = :title, description = :description, dueDate = :dueDate, #taskStatus = :status, updatedAt = :updatedAt',
+        'set title = :title, description = :description, dueDate = :dueDate, #taskStatus = :status, updatedAt = :updatedAt' +
+        (imageKey ? ', imageKey = :imageKey' : ''),
       ExpressionAttributeNames: {
         '#taskStatus': 'status', // "status" is a reserved word in DynamoDB
       },
@@ -159,12 +183,24 @@ async function updateTask(taskId: string, body: any) {
         ':dueDate': dueDate ?? null,
         ':status': status ?? 'pending',
         ':updatedAt': new Date().toISOString(),
+        ...(imageKey ? { ':imageKey': imageKey } : {}),
       },
       ReturnValues: 'ALL_NEW',
     })
   );
 
-  return json(200, result.Attributes);
+  const updated = await withImageViewUrl(result.Attributes!);
+
+  let imageUploadUrl: string | undefined;
+  if (imageKey) {
+    imageUploadUrl = await getSignedUrl(
+      s3,
+      new PutObjectCommand({ Bucket: BUCKET_NAME, Key: imageKey }),
+      { expiresIn: 300 }
+    );
+  }
+
+  return json(200, { ...updated, imageUploadUrl });
 }
 
 async function deleteTask(taskId: string, userId?: string) {
@@ -212,5 +248,5 @@ async function processImage(taskId: string, body: any) {
     })
   );
 
-  return json(200, result.Attributes);
+  return json(200, await withImageViewUrl(result.Attributes!));
 }
